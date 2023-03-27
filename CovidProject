@@ -1,0 +1,249 @@
+PROJECT - 1
+
+step - 1 (create folders)
+hadoop fs -mkdir /data/project
+hadoop fs -mkdir /data/project/testing
+hadoop fs -mkdir /data/project/covid
+
+step - 2 (move the csv files to the HDFS directories)
+hadoop fs -put /home/cloudera/Desktop/shared/covid.csv /data/project/covid
+hadoop fs -put /home/cloudera/Desktop/shared/testing.csv /data/project/testing
+
+step - 3 (verify and count)
+hadoop fs -cat /data/project/covid/covid.csv | head
+hadoop fs -cat /data/project/testing/testing.csv | head
+hadoop fs -cat /data/project/covid/covid.csv | wc -l
+hadoop fs -cat /data/project/testing/testing.csv | wc -l
+
+step - 4 (creation of tables in mysql)
+create database covid;
+use covid;
+
+create table IF NOT EXISTS State_Testing(
+seq INT NOT NULL PRIMARY KEY,
+date VARCHAR (30),
+state VARCHAR (50) NOT NULL,
+total_samples INT,
+negative INT,
+positive INT);
+
+create table IF NOT EXISTS Covid_India(
+sno INT NOT NULL PRIMARY KEY,
+date VARCHAR (30),
+state VARCHAR (50) NOT NULL,
+cured INT,
+deaths INT,
+confirmed INT);
+
+step - 5 (sqoop export)
+The best practice is to create a staging table so that if the export fails the main table is not impacted.
+But for simplicity purpose I am directly exporting to the main table.
+
+sqoop-export \
+-Dhadoop.security.credential.provider.path=jceks://hdfs/user/cloudera/encryptpswd/jceks_pswdfile \
+--connect jdbc:mysql://10.0.2.15:3306/covid \
+--username root \
+--password-alias mysql.covid.securepassword \
+--table State_Testing \
+--export-dir /data/project/testing \
+--fields-terminated-by ","
+
+sqoop-export \
+-Dhadoop.security.credential.provider.path=jceks://hdfs/user/cloudera/encryptpswd/jceks_pswdfile \
+--connect jdbc:mysql://10.0.2.15:3306/covid \
+--username root \
+--password-alias mysql.covid.securepassword \
+--table Covid_India \
+--export-dir /data/project/covid \
+--fields-terminated-by ","
+
+step - 6 (verify in mysql)
+select count(*) from State_Testing;
+select count(*) from Covid_India;
+
+step - 7 (sqoop import - starting point of the problem)
+hadoop fs -mkdir /data/project/sqoop_import
+
+sqoop job \
+-Dhadoop.security.credential.provider.path=jceks://hdfs/user/cloudera/encryptpswd/jceks_pswdfile \
+--create job_testing \
+-- import \
+--connect jdbc:mysql://10.0.2.15:3306/covid \
+--username root \
+--password-alias mysql.covid.securepassword \
+--table State_Testing \
+--warehouse-dir /data/project/sqoop_import \
+--incremental append \
+--check-column seq \
+--last-value 0 \
+
+sqoop job \
+-Dhadoop.security.credential.provider.path=jceks://hdfs/user/cloudera/encryptpswd/jceks_pswdfile \
+--create job_covid \
+-- import \
+--connect jdbc:mysql://10.0.2.15:3306/covid \
+--username root \
+--password-alias mysql.covid.securepassword \
+--table Covid_India \
+--warehouse-dir /data/project/sqoop_import \
+--incremental append \
+--check-column sno \
+--last-value 0 \
+
+sqoop job --exec job_testing
+sqoop job --exec job_covid
+hadoop fs -ls /data/project/sqoop_import/Covid_India
+hadoop fs -ls /data/project/sqoop_import/State_Testing
+
+step - 8 (creating hive table on top of sqoop import data)
+CREATE EXTERNAL TABLE IF NOT EXISTS State_Testing(
+seq INT,
+date STRING,
+state STRING,
+total_samples INT,
+negative INT,
+positive INT)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY',' 
+STORED AS TEXTFILE
+LOCATION '/data/project/sqoop_import/State_Testing';
+
+CREATE EXTERNAL TABLE IF NOT EXISTS Covid_India(
+sno INT,
+date STRING,
+state STRING,
+cured INT,
+deaths INT,
+confirmed INT)
+ROW FORMAT DELIMITED FIELDS TERMINATED BY',' 
+STORED AS TEXTFILE
+LOCATION '/data/project/sqoop_import/Covid_India';
+
+step - 9 (hive tables with partition and bucketing)
+
+hadoop fs -mkdir /data/project/partition_covid
+hadoop fs -mkdir /data/project/partition_state
+
+set hive.exec.dynamic.partition=true;
+set hive.exec.dynamic.partition.mode=nonstrict;
+set hive.enforce.bucketing=true;
+
+CREATE EXTERNAL TABLE IF NOT EXISTS State_Testing_ORC(
+seq INT,
+date DATE,
+total_samples INT,
+negative INT,
+positive INT)
+PARTITIONED BY (state STRING)
+CLUSTERED BY (date) into 4 BUCKETS
+STORED AS ORC LOCATION '/data/project/partition_state'
+TBLPROPERTIES('orc.compress'='SNAPPY');
+
+INSERT OVERWRITE TABLE State_Testing_ORC
+PARTITION(state)
+SELECT seq,from_unixtime(unix_timestamp(date,'M/dd/yyyy'),'yyyy-MM-dd'),
+total_samples,negative,positive,state FROM State_Testing;
+
+hadoop fs -ls /data/project/partition_state
+
+CREATE EXTERNAL TABLE IF NOT EXISTS Covid_India_ORC(
+sno INT,
+date STRING,
+cured INT,
+deaths INT,
+confirmed INT)
+PARTITIONED BY (state STRING)
+CLUSTERED BY (date) into 4 BUCKETS
+STORED AS ORC LOCATION '/data/project/partition_covid'
+TBLPROPERTIES('orc.compress'='SNAPPY');
+
+INSERT OVERWRITE TABLE Covid_India_ORC
+PARTITION(state)
+SELECT sno,from_unixtime(unix_timestamp(date,'dd/M/yy'),'yyyy-MM-dd'),
+cured,deaths,confirmed,state FROM Covid_India;
+
+hadoop fs -ls /data/project/partition_covid
+
+step - 10 (perform inner join)
+
+SELECT T.state,T.date,T.total_samples,T.negative,T.positive,C.cured,C.deaths,C.confirmed FROM State_Testing_ORC T JOIN Covid_India_ORC C
+ ON (C.state=T.state) AND (C.date=T.date) LIMIT 10;
+
+CREATE TABLE covid_details as 
+SELECT T.state,T.date,T.total_samples,T.negative,T.positive,C.cured,C.deaths,C.confirmed FROM State_Testing_ORC T JOIN Covid_India_ORC C
+ ON (C.state=T.state) AND (C.date=T.date);
+
+select count(*) from covid_details;
+
+step - 11
+we can even create a hive-hbase table for quick access of data and can have nearly 10 times performance gains when accessing a record through hbase.
+
+CREATE TABLE cov(rkey string,state string,date date,total_samples int,negative int,positive int,cured int,deaths int,confirmed int)
+STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler' with SERDEPROPERTIES ("hbase.columns.mapping"=":key,testing:state,testing:date,testing:total_samples,
+testing:negative,testing:positive,covidcases:cured,covidcases:deaths,covidcases:confirmed")TBLPROPERTIES("hbase.table.name"="cov_hbase");
+
+insert overwrite table cov SELECT concat(T.state,'_',T.date) as rkey,T.state,T.date,T.total_samples,T.negative,T.positive,C.cured,C.deaths,C.confirmed FROM State_Testing_ORC T JOIN
+Covid_India_ORC C ON(C.state=T.state)AND(C.date=T.date); 
+
+select count(*) from cov;
+count 'cov_hbase'
+select * from cov limit 10;
+scan 'cov_hbase'
+=================================================================================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
